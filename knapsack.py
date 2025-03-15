@@ -1,3 +1,4 @@
+#!/usr/bin/env python
 # Copyright 2021 D-Wave Systems Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -11,122 +12,112 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 import os
+import math
 import itertools
 import click
 import pandas as pd
-from dwave.system import LeapHybridCQMSampler
-from dimod import ConstrainedQuadraticModel, BinaryQuadraticModel, QuadraticModel
+from neal import SimulatedAnnealingSampler
+import dimod
+
 
 def parse_inputs(data_file, capacity):
-    """Parse user input and files for data to build CQM.
-
-    Args:
-        data_file (csv file):
-            File of items (weight & cost) slated to ship.
-        capacity (int):
-            Max weight the shipping container can accept.
-
-    Returns:
-        Costs, weights, and capacity.
+    """
+    Читает входной CSV-файл с данными об элементах (стоимость и вес) и возвращает
+    стоимости, веса и вместимость контейнера.
     """
     df = pd.read_csv(data_file, names=['cost', 'weight'])
-
     if not capacity:
         capacity = int(0.8 * sum(df['weight']))
-        print("\nSetting weight capacity to 80% of total: {}".format(str(capacity)))
-
+        print("\nSetting weight capacity to 80% of total: {}".format(capacity))
     return df['cost'], df['weight'], capacity
 
-def build_knapsack_cqm(costs, weights, max_weight):
-    """Construct a CQM for the knapsack problem.
 
-    Args:
-        costs (array-like):
-            Array of costs for the items.
-        weights (array-like):
-            Array of weights for the items.
-        max_weight (int):
-            Maximum allowable weight for the knapsack.
-
-    Returns:
-        Constrained quadratic model instance that represents the knapsack problem.
+def build_knapsack_bqm(costs, weights, max_weight, A=1000):
     """
-    num_items = len(costs)
-    print("\nBuilding a CQM for {} items.".format(str(num_items)))
+    Формирует BQM для задачи рюкзака.
 
-    cqm = ConstrainedQuadraticModel()
-    obj = BinaryQuadraticModel(vartype='BINARY')
-    constraint = QuadraticModel()
+    Параметры:
+      costs  - стоимости предметов (целевое значение максимизировать)
+      weights - веса предметов
+      max_weight - вместимость рюкзака (ограничение)
+      A - штрафной коэффициент (чем выше, тем строже ограничение)
 
-    for i in range(num_items):
-        # Objective is to maximize the total costs
-        obj.add_variable(i)
-        obj.set_linear(i, -costs[i])
-        # Constraint is to keep the sum of items' weights under or equal capacity
-        constraint.add_variable('BINARY', i)
-        constraint.set_linear(i, weights[i])
-
-    cqm.set_objective(obj)
-    cqm.add_constraint(constraint, sense="<=", rhs=max_weight, label='capacity')
-
-    return cqm
-
-def parse_solution(sampleset, costs, weights):
-    """Translate the best sample returned from solver to shipped items.
-
-    Args:
-
-        sampleset (dimod.Sampleset):
-            Samples returned from the solver.
-        costs (array-like):
-            Array of costs for the items.
-        weights (array-like):
-            Array of weights for the items.
+    Для кодирования неравенства применяется метод введения слэк-переменных.
+    Пусть n – число предметов, а m = ceil(log2(max_weight+1)) – число бинарных слэк-переменных,
+    тогда требуемое равенство:
+         sum_i weights[i] * x_i + sum_{j=0}^{m-1} 2^j * s_j = max_weight.
+    Итоговая функция:
+         f(x,s) = - sum_i cost_i * x_i + A*(sum_i weights[i]*x_i + sum_j 2^j*s_j - max_weight)^2.
     """
-    feasible_sampleset = sampleset.filter(lambda row: row.is_feasible)
+    n = len(costs)
+    m = math.ceil(math.log2(max_weight + 1))  # число слэк-переменных
+    bqm = dimod.BinaryQuadraticModel({}, {}, 0.0, dimod.BINARY)
 
-    if not len(feasible_sampleset):
-        raise ValueError("No feasible solution found")
+    # Добавляем переменные предметов: x0, x1, ... x{n-1}
+    for i in range(n):
+        var = f'x{i}'
+        # Целевая функция: -cost_i * x_i
+        # Штраф: A*(w_i^2)*x_i - 2*A*max_weight*w_i*x_i
+        bqm.add_variable(var, -costs[i] + A * (weights[i] ** 2) - 2 * A * max_weight * weights[i])
 
-    best = feasible_sampleset.first
+    # Добавляем слэк-переменные: s0, s1, ..., s{m-1}
+    for j in range(m):
+        var = f's{j}'
+        coef = A * ((2 ** j) ** 2) - 2 * A * max_weight * (2 ** j)
+        bqm.add_variable(var, coef)
 
-    selected_item_indices = [key for key, val in best.sample.items() if val==1.0]
-    selected_weights = list(weights.loc[selected_item_indices])
-    selected_costs = list(costs.loc[selected_item_indices])
+    # Добавляем квадратичные взаимодействия между переменными предметов
+    for i in range(n):
+        for k in range(i + 1, n):
+            bqm.add_interaction(f'x{i}', f'x{k}', 2 * A * weights[i] * weights[k])
 
-    print("\nFound best solution at energy {}".format(best.energy))
-    print("\nSelected item numbers (0-indexed):", selected_item_indices)
-    print("\nSelected item weights: {}, total = {}".format(selected_weights, sum(selected_weights)))
-    print("\nSelected item costs: {}, total = {}".format(selected_costs, sum(selected_costs)))
+    # Взаимодействие между предметами и слэк-переменными
+    for i in range(n):
+        for j in range(m):
+            bqm.add_interaction(f'x{i}', f's{j}', 2 * A * weights[i] * (2 ** j))
+
+    # Взаимодействия между слэк-переменными
+    for j in range(m):
+        for l in range(j + 1, m):
+            bqm.add_interaction(f's{j}', f's{l}', 2 * A * (2 ** j) * (2 ** l))
+
+    # Добавляем смещение (константный член); его можно опустить, т.к. оно не влияет на оптимизацию
+    bqm.offset += A * (max_weight ** 2)
+
+    return bqm
+
+
+def parse_solution(sampleset, n):
+    """
+    Извлекает лучшее решение (набор выбранных предметов) из SampleSet.
+    Переменные, начинающиеся с 'x', соответствуют предметам.
+    """
+    best = sampleset.first.sample
+    selected_item_indices = [i for i in range(n) if best.get(f'x{i}', 0) == 1]
+    return selected_item_indices
+
 
 def datafile_help(max_files=5):
-    """Provide content of input file names and total weights for click()'s --help."""
-
+    """
+    Форматирует справку по входным файлам для опции --filename.
+    """
     try:
         data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
         datafiles = os.listdir(data_dir)
-        # "\b" enables newlines in click() help text
-        help = """
-\b
-Name of data file (under the 'data/' folder) to run on.
-One of:
-File Name \t Total weight
-"""
+        help_text = "\nName of data file (under the 'data/' folder) to run on.\nOne of:\n"
         for file in datafiles[:max_files]:
             _, weights, _ = parse_inputs(os.path.join(data_dir, file), 1234)
-            help += "{:<20} {:<10} \n".format(str(file), str(sum(weights)))
-        help += "\nDefault is to run on data/large.csv."
-    except:
-        help = """
-\b
-Name of data file (under the 'data/' folder) to run on.
-Default is to run on data/large.csv.
-"""
+            help_text += f"{file:20} {sum(weights)}\n"
+        help_text += "\nDefault is to run on data/large.csv."
+    except Exception:
+        help_text = "\nName of data file (under the 'data/' folder) to run on.\nDefault is to run on data/large.csv."
+    return help_text
 
-    return help
 
-filename_help = datafile_help()     # Format the help string for the --filename argument
+filename_help = datafile_help()
+
 
 @click.command()
 @click.option('--filename', type=click.File(), default='data/large.csv',
@@ -134,18 +125,20 @@ filename_help = datafile_help()     # Format the help string for the --filename 
 @click.option('--capacity', default=None,
               help="Maximum weight for the container. By default sets to 80% of the total.")
 def main(filename, capacity):
-    """Solve a knapsack problem using a CQM solver."""
-
-    sampler = LeapHybridCQMSampler()
-
+    sampler = SimulatedAnnealingSampler()
     costs, weights, capacity = parse_inputs(filename, capacity)
 
-    cqm = build_knapsack_cqm(costs, weights, capacity)
+    print("Building BQM for knapsack problem with {} items.".format(len(costs)))
+    bqm = build_knapsack_bqm(costs, weights, capacity, A=1000)
 
-    print("Submitting CQM to solver {}.".format(sampler.solver.name))
-    sampleset = sampler.sample_cqm(cqm, label='Example - Knapsack')
+    print("Submitting BQM to solver {}.".format(sampler.__class__.__name__))
+    sampleset = sampler.sample(bqm, num_reads=1000, label='Example - Knapsack')
 
-    parse_solution(sampleset, costs, weights)
+    selected = parse_solution(sampleset, len(costs))
+
+    print("\nFound best solution with energy {}.".format(sampleset.first.energy))
+    print("Selected item indices (0-indexed):", selected)
+
 
 if __name__ == '__main__':
     main()

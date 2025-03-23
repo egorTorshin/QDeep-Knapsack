@@ -23,10 +23,6 @@ import dimod
 
 
 def parse_inputs(data_file, capacity):
-    """
-    Читает входной CSV-файл с данными об элементах (стоимость и вес) и возвращает
-    стоимости, веса и вместимость контейнера.
-    """
     df = pd.read_csv(data_file, names=['cost', 'weight'])
     if not capacity:
         capacity = int(0.8 * sum(df['weight']))
@@ -35,74 +31,43 @@ def parse_inputs(data_file, capacity):
 
 
 def build_knapsack_bqm(costs, weights, max_weight, A=1000):
-    """
-    Формирует BQM для задачи рюкзака.
-
-    Параметры:
-      costs  - стоимости предметов (целевое значение максимизировать)
-      weights - веса предметов
-      max_weight - вместимость рюкзака (ограничение)
-      A - штрафной коэффициент (чем выше, тем строже ограничение)
-
-    Для кодирования неравенства применяется метод введения слэк-переменных.
-    Пусть n – число предметов, а m = ceil(log2(max_weight+1)) – число бинарных слэк-переменных,
-    тогда требуемое равенство:
-         sum_i weights[i] * x_i + sum_{j=0}^{m-1} 2^j * s_j = max_weight.
-    Итоговая функция:
-         f(x,s) = - sum_i cost_i * x_i + A*(sum_i weights[i]*x_i + sum_j 2^j*s_j - max_weight)^2.
-    """
     n = len(costs)
-    m = math.ceil(math.log2(max_weight + 1))  # число слэк-переменных
+    m = math.ceil(math.log2(max_weight + 1)) 
     bqm = dimod.BinaryQuadraticModel({}, {}, 0.0, dimod.BINARY)
 
-    # Добавляем переменные предметов: x0, x1, ... x{n-1}
     for i in range(n):
         var = f'x{i}'
-        # Целевая функция: -cost_i * x_i
-        # Штраф: A*(w_i^2)*x_i - 2*A*max_weight*w_i*x_i
         bqm.add_variable(var, -costs[i] + A * (weights[i] ** 2) - 2 * A * max_weight * weights[i])
 
-    # Добавляем слэк-переменные: s0, s1, ..., s{m-1}
     for j in range(m):
         var = f's{j}'
         coef = A * ((2 ** j) ** 2) - 2 * A * max_weight * (2 ** j)
         bqm.add_variable(var, coef)
 
-    # Добавляем квадратичные взаимодействия между переменными предметов
     for i in range(n):
         for k in range(i + 1, n):
             bqm.add_interaction(f'x{i}', f'x{k}', 2 * A * weights[i] * weights[k])
 
-    # Взаимодействие между предметами и слэк-переменными
     for i in range(n):
         for j in range(m):
             bqm.add_interaction(f'x{i}', f's{j}', 2 * A * weights[i] * (2 ** j))
 
-    # Взаимодействия между слэк-переменными
     for j in range(m):
         for l in range(j + 1, m):
             bqm.add_interaction(f's{j}', f's{l}', 2 * A * (2 ** j) * (2 ** l))
 
-    # Добавляем смещение (константный член); его можно опустить, т.к. оно не влияет на оптимизацию
     bqm.offset += A * (max_weight ** 2)
 
     return bqm
 
 
 def parse_solution(sampleset, n):
-    """
-    Извлекает лучшее решение (набор выбранных предметов) из SampleSet.
-    Переменные, начинающиеся с 'x', соответствуют предметам.
-    """
     best = sampleset.first.sample
     selected_item_indices = [i for i in range(n) if best.get(f'x{i}', 0) == 1]
     return selected_item_indices
 
 
 def datafile_help(max_files=5):
-    """
-    Форматирует справку по входным файлам для опции --filename.
-    """
     try:
         data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
         datafiles = os.listdir(data_dir)

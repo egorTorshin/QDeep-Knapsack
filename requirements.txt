@@ -1,4 +1,3 @@
-dwave-ocean-sdk>=4.1
+qdeepsdk
 pandas
 click
-dwave-neal

@@ -15,11 +15,11 @@
 
 import os
 import math
-import itertools
-import click
 import pandas as pd
-from neal import SimulatedAnnealingSampler
+import click
+from qdeepsdk import QDeepHybridSolver
 import dimod
+import numpy as np
 
 
 def parse_inputs(data_file, capacity):
@@ -32,7 +32,7 @@ def parse_inputs(data_file, capacity):
 
 def build_knapsack_bqm(costs, weights, max_weight, A=1000):
     n = len(costs)
-    m = math.ceil(math.log2(max_weight + 1)) 
+    m = math.ceil(math.log2(max_weight + 1))
     bqm = dimod.BinaryQuadraticModel({}, {}, 0.0, dimod.BINARY)
 
     for i in range(n):
@@ -61,9 +61,9 @@ def build_knapsack_bqm(costs, weights, max_weight, A=1000):
     return bqm
 
 
-def parse_solution(sampleset, n):
-    best = sampleset.first.sample
-    selected_item_indices = [i for i in range(n) if best.get(f'x{i}', 0) == 1]
+def parse_solution(configuration, n):
+    # The configuration contains the solution in a list of 0s and 1s
+    selected_item_indices = [i for i in range(n) if configuration[i] == 1]
     return selected_item_indices
 
 
@@ -90,18 +90,29 @@ filename_help = datafile_help()
 @click.option('--capacity', default=None,
               help="Maximum weight for the container. By default sets to 80% of the total.")
 def main(filename, capacity):
-    sampler = SimulatedAnnealingSampler()
+    solver = QDeepHybridSolver()
+    solver.token = 'mtagdfsplb'  # Use your actual token here
     costs, weights, capacity = parse_inputs(filename, capacity)
 
     print("Building BQM for knapsack problem with {} items.".format(len(costs)))
     bqm = build_knapsack_bqm(costs, weights, capacity, A=1000)
 
-    print("Submitting BQM to solver {}.".format(sampler.__class__.__name__))
-    sampleset = sampler.sample(bqm, num_reads=1000, label='Example - Knapsack')
+    # Get the variable order and convert BQM to numpy matrix
+    variable_order = list(bqm.variables)
+    bqm_matrix = bqm.to_numpy_matrix(variable_order=variable_order)
 
-    selected = parse_solution(sampleset, len(costs))
+    print("Submitting BQM to solver {}.".format(solver.__class__.__name__))
 
-    print("\nFound best solution with energy {}.".format(sampleset.first.energy))
+    # Solve using the QDeepHybridSolver with numpy matrix
+    response = solver.solve(bqm_matrix)
+
+    # Access the configuration from the response
+    configuration = response['QdeepHybridSolver']['configuration']
+
+    # Parse the solution
+    selected = parse_solution(configuration, len(costs))
+
+    print("\nFound best solution with energy {}.".format(response['QdeepHybridSolver']['energy']))
     print("Selected item indices (0-indexed):", selected)
 
 

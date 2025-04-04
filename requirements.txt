@@ -1,3 +1,4 @@
 qdeepsdk
 pandas
 click
+dimod
